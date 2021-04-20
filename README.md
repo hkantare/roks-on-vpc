@@ -2,6 +2,8 @@
 
 This template creates a Red Hat OpenShift cluster on an existing VPC. To create this cluster, a COS instance is created for cluster storage, and a Key Protect instance is created for encryption.
 
+To create a VPC for your cluster, use the [Multizone VPC Gen2 Asset](https://github.com/Cloud-Schematics/multizone-vpc-gen2)
+
 ![OpenShift Cluster](./.docs/roks-cluster.png)
 
 ---
