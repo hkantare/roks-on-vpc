@@ -1,3 +1,14 @@
+locals {
+  worker_zones = { for subnet in data.ibm_is_subnet.subnets : subnet.zone => { "subnet_id" = subnet.id } }
+
+  kms_config = [{
+    instance_id      = module.kms.kms_instance_guid
+    crk_id           = module.kms.kms_key_id
+    private_endpoint = false
+    },
+  ]
+}
+
 ##############################################################################
 # Resource Group
 ##############################################################################
@@ -8,7 +19,6 @@ data ibm_resource_group resource_group {
 
 ##############################################################################
 
-
 ##############################################################################
 # VPC Data
 #############################################################################
@@ -16,9 +26,6 @@ data ibm_resource_group resource_group {
 data ibm_is_vpc vpc {
   name = var.vpc_name
 }
-
-#############################################################################
-
 
 #############################################################################
 # Get Subnet Data
@@ -32,34 +39,23 @@ data ibm_is_subnet subnets {
   name  = var.subnet_names[count.index]
 }
 
-#############################################################################
-
-
 ##############################################################################
-# Resources
-##############################################################################
-# Key Protect
+# KMS
 ##############################################################################
 
-resource ibm_resource_instance kms {
-  name              = "${var.unique_id}-kms"
-  location          = var.ibm_region
-  plan              = var.kms_plan
-  resource_group_id = data.ibm_resource_group.resource_group.id
-  service           = "kms"
-  service_endpoints = var.service_endpoints
-}
-
-##############################################################################
-
-##############################################################################
-# Key Protect Root Key
-##############################################################################
-
-resource ibm_kms_key root_key {
-  instance_id  = ibm_resource_instance.kms.guid
-  key_name     = var.kms_root_key_name
-  standard_key = false
+module kms {
+  source = "terraform-ibm-modules/kms/ibm//modules/key-protect"
+  is_kp_instance_exist   = false
+  resource_group_id      = data.ibm_resource_group.resource_group.id
+  service_name           = var.service_name
+  location               = var.location
+  plan                   = "tiered-pricing"
+  tags                   = var.kms_tags
+  allowed_network_policy = var.allowed_network_policy
+  key_name               = var.key_name
+  standard_key_type      = var.standard_key_type
+  force_delete           = var.force_delete
+  network_access_allowed = var.network_access_allowed
 }
 
 ##############################################################################
@@ -68,104 +64,70 @@ resource ibm_kms_key root_key {
 # COS Instance
 ##############################################################################
 
-resource ibm_resource_instance cos {
-  name              = "${var.unique_id}-cos"
-  service           = "cloud-object-storage"
-  plan              = "standard"
-  location          = "global"
-  resource_group_id = data.ibm_resource_group.resource_group.id != "" ? data.ibm_resource_group.resource_group.id : null
-
-  parameters = {
-    service-endpoints = "private"
-  }
-
-  timeouts {
-    create = "1h"
-    update = "1h"
-    delete = "1h"
-  }
-
-}
-
-##############################################################################
-
-##############################################################################
-# Policy for KMS
-##############################################################################
-
-resource ibm_iam_authorization_policy cos_policy {
-  source_service_name         = "cloud-object-storage"
-  source_resource_instance_id = ibm_resource_instance.cos.id
-  target_service_name         = "kms"
-  target_resource_instance_id = ibm_resource_instance.kms.id
-  roles                       = ["Reader"]
-}
-
-##############################################################################
-##############################################################################
-
-##############################################################################
-# Create IKS on VPC Cluster
-##############################################################################
-
-resource ibm_container_vpc_cluster cluster {
-
-  name              = "${var.unique_id}-roks-cluster"
-  vpc_id            = data.ibm_is_vpc.vpc.id
+module cos {
+  source = "terraform-ibm-modules/cos/ibm//modules/instance"
+  service_name      = var.cos_instance_name
   resource_group_id = data.ibm_resource_group.resource_group.id
-  flavor            = var.machine_type
-  worker_count      = var.workers_per_zone
-  kube_version      = var.kube_version != "" ? var.kube_version : null
-  tags              = var.tags
-  wait_till         = var.wait_till
-  entitlement       = var.entitlement
-  cos_instance_crn  = ibm_resource_instance.cos.id
+  plan              = var.plan
+  region            = var.region
+  parameters        = var.parameters
+  create_timeout    = var.create_timeout
+  update_timeout    = var.update_timeout
+  delete_timeout    = var.delete_timeout
+}
 
-  dynamic zones {
-    for_each = data.ibm_is_subnet.subnets
-    content {
-      subnet_id = zones.value.id
-      name      = zones.value.zone
-    }
-  }
+##############################################################################
 
+##############################################################################
+# IAM Authorization
+##############################################################################
+
+module "authorization_policy" {
+  source = "terraform-ibm-modules/iam/ibm//modules/service-authorization"
+  source_service_name         = "cloud-object-storage"
+  target_service_name         = "kms"
+  roles                       = var.iam_roles
+  source_resource_instance_id = module.cos.cos_instance_id
+  target_resource_instance_id = module.kms.kms_key_crn
+}
+
+##############################################################################
+##############################################################################
+# Container VPC Cluster
+##############################################################################
+module "container_vpc_cluster" {
+  source = "terraform-ibm-modules/cluster/ibm//modules/vpc-openshift"
+  cluster_name                    = "${var.unique_id}-roks-cluster"
+  vpc_id                          = data.ibm_is_vpc.vpc.id
+  resource_group_id               = data.ibm_resource_group.resource_group.id
+  worker_pool_flavor              = var.worker_pool_flavor
+  worker_nodes_per_zone           = var.worker_nodes_per_zone
+  kube_version                    = var.kube_version
+  tags                            = var.cluster_tags
+  wait_till                       = var.wait_till
+  cos_instance_crn                = module.cos.cos_instance_id
+  entitlement                     = var.entitlement
+  worker_zones                    = local.worker_zones
   disable_public_service_endpoint = var.disable_public_service_endpoint
-
-  kms_config {
-    instance_id      = ibm_resource_instance.kms.guid
-    crk_id           = ibm_kms_key.root_key.key_id
-    private_endpoint = var.kms_private_service_endpoint
-  }
+  kms_config                      = local.kms_config
+  create_timeout                  = var.create_timeout
+  update_timeout                  = var.update_timeout
+  delete_timeout                  = var.delete_timeout
 
 }
-
 ##############################################################################
-
+# Worker pool
 ##############################################################################
-# Worker Pools
-##############################################################################
-
-resource ibm_container_vpc_worker_pool pool {
-
-    count              = length(var.worker_pools)
-    vpc_id             = var.vpc_id
-    resource_group_id  = data.ibm_resource_group.resource_group.id
-    entitlement        = var.entitlement
-    cluster            = ibm_container_vpc_cluster.cluster.id
-    worker_pool_name   = var.pool_list[count.index].pool_name
-    flavor             = var.pool_list[count.index].machine_type
-    worker_count       = var.pool_list[count.index].workers_per_zone
-
-    dynamic zones {
-        for_each = data.ibm_is_subnet.subnets
-        content {
-            subnet_id = zones.value.id
-            name      = zones.value.zone
-        }
-    }
-
-
+module "vpc_cluster_worker_pool" {
+  source = "terraform-ibm-modules/cluster/ibm//modules/configure-vpc-worker-pool"
+  for_each              = { for wp in var.worker_pool_data : wp.pool_name => wp }
+  worker_pool_name      = each.value.pool_name
+  flavor                = each.value.machine_type
+  worker_nodes_per_zone = each.value.workers_per_zone
+  cluster_name          = module.container_vpc_cluster.vpc_openshift_cluster_id
+  resource_group_id     = data.ibm_resource_group.resource_group.id
+  virtual_private_cloud = data.ibm_is_vpc.vpc.id
+  worker_zones          = local.worker_zones
+  entitlement           = var.entitlement
 }
 
-
-##############################################################################
